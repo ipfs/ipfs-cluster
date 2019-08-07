@@ -26,6 +26,7 @@ import (
 	rpc "github.com/libp2p/go-libp2p-gorpc"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	ma "github.com/multiformats/go-multiaddr"
+	"github.com/whyrusleeping/timecache"
 
 	ocgorpc "github.com/lanzafame/go-libp2p-ocgorpc"
 	trace "go.opencensus.io/trace"
@@ -43,6 +44,8 @@ const (
 	reBootstrapInterval = 30 * time.Second
 )
 
+var errUnauthPeerCache = errors.New("avoiding request to this peer since it unauthorized recently")
+
 // Cluster is the main IPFS cluster component. It provides
 // the go-API for it and orchestrates the components that make up the system.
 type Cluster struct {
@@ -58,6 +61,8 @@ type Cluster struct {
 	rpcServer   *rpc.Server
 	rpcClient   *rpc.Client
 	peerManager *pstoremgr.Manager
+
+	unauthPeerTimeCache *timecache.TimeCache
 
 	consensus Consensus
 	apis      []API
@@ -174,6 +179,8 @@ func NewCluster(
 		return nil, err
 	}
 	c.setupRPCClients()
+
+	c.unauthPeerTimeCache = timecache.NewTimeCache(c.config.UnauthorizedRequestCacheSpan)
 
 	// Note: It is very important to first call Add() once in a non-racy
 	// place
@@ -1506,7 +1513,7 @@ func (c *Cluster) globalPinInfoCid(ctx context.Context, comp, method string, h c
 	ctxs, cancels := rpcutil.CtxsWithCancel(ctx, lenMembers)
 	defer rpcutil.MultiCancel(cancels)
 
-	errs := c.rpcClient.MultiCall(
+	errs := c.multiCallWrapper(
 		ctxs,
 		members,
 		comp,
@@ -1524,7 +1531,7 @@ func (c *Cluster) globalPinInfoCid(ctx context.Context, comp, method string, h c
 			continue
 		}
 
-		if rpc.IsAuthorizationError(e) {
+		if rpc.IsAuthorizationError(e) || e == errUnauthPeerCache {
 			logger.Debug("rpc auth error:", e)
 			continue
 		}
@@ -1563,7 +1570,7 @@ func (c *Cluster) globalPinInfoSlice(ctx context.Context, comp, method string) (
 	ctxs, cancels := rpcutil.CtxsWithCancel(ctx, lenMembers)
 	defer rpcutil.MultiCancel(cancels)
 
-	errs := c.rpcClient.MultiCall(
+	errs := c.multiCallWrapper(
 		ctxs,
 		members,
 		comp,
@@ -1594,7 +1601,7 @@ func (c *Cluster) globalPinInfoSlice(ctx context.Context, comp, method string) (
 	erroredPeers := make(map[peer.ID]string)
 	for i, r := range replies {
 		if e := errs[i]; e != nil { // This error must come from not being able to contact that cluster member
-			if rpc.IsAuthorizationError(e) {
+			if rpc.IsAuthorizationError(e) || e == errUnauthPeerCache {
 				logger.Debug("rpc auth error", e)
 				continue
 			}
@@ -1737,4 +1744,48 @@ func diffPeers(peers1, peers2 []peer.ID) (added, removed []peer.ID) {
 		}
 	}
 	return
+}
+
+func (c *Cluster) multiCallWrapper(
+	ctxs []context.Context,
+	dests []peer.ID,
+	svcName, svcMethod string,
+	args interface{},
+	replies []interface{}) []error {
+
+	if !checkMatchingLengths(len(ctxs), len(dests), len(replies)) {
+		panic("ctxs, dests and replies must match in length")
+	}
+
+	errs := make([]error, len(dests))
+	var actualCtxs []context.Context
+	var actualDests []peer.ID
+	var actualReplies []interface{}
+
+	for i, p := range dests {
+		if c.unauthPeerTimeCache.Has(string(p)) {
+			errs[i] = errUnauthPeerCache
+			continue
+		}
+		actualCtxs = append(actualCtxs, ctxs[i])
+		actualDests = append(actualDests, dests[i])
+		actualReplies = append(actualReplies, replies[i])
+	}
+
+	actualErrors := c.rpcClient.MultiCall(actualCtxs, actualDests, svcName, svcMethod, args, actualReplies)
+
+	k := 0
+	for i, e := range errs {
+		if e != nil {
+			continue
+		}
+
+		if rpc.IsAuthorizationError(actualErrors[k]) {
+			c.unauthPeerTimeCache.Add(string(dests[i]))
+		}
+		errs[i] = actualErrors[k]
+		k++
+	}
+
+	return errs
 }
