@@ -125,16 +125,11 @@ func (opt *OperationTracker) SetError(ctx context.Context, c cid.Cid, err error)
 	opt.mu.Lock()
 	defer opt.mu.Unlock()
 	op, ok := opt.operations[c.String()]
-	if !ok {
-		return
-	}
-
-	if ty := op.Type(); ty == OperationRemote {
+	if !ok || op.Type() == OperationRemote {
 		return
 	}
 
 	if ph := op.Phase(); ph == PhaseDone || ph == PhaseError {
-		op.SetPhase(PhaseError)
 		op.SetError(err)
 	}
 }

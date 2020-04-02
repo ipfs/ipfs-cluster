@@ -7,9 +7,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ipfs/ipfs-cluster/api"
+	"github.com/ipfs/ipfs-cluster/observations"
+
 	cid "github.com/ipfs/go-cid"
 
-	"github.com/ipfs/ipfs-cluster/api"
+	"go.opencensus.io/stats"
 	"go.opencensus.io/trace"
 )
 
@@ -73,7 +76,7 @@ func NewOperation(ctx context.Context, pin *api.Pin, typ OperationType, ph Phase
 	defer span.End()
 
 	ctx, cancel := context.WithCancel(ctx)
-	return &Operation{
+	op := Operation{
 		ctx:    ctx,
 		cancel: cancel,
 
@@ -83,6 +86,10 @@ func NewOperation(ctx context.Context, pin *api.Pin, typ OperationType, ph Phase
 		ts:     time.Now(),
 		error:  "",
 	}
+
+	stats.Record(op.ctx, observations.GetMeasureFromStatus(op.ToTrackerStatus()).M(1))
+
+	return &op
 }
 
 // String returns a string representation of an Operation.
@@ -138,12 +145,17 @@ func (op *Operation) Phase() Phase {
 // SetPhase changes the Phase and updates the timestamp.
 func (op *Operation) SetPhase(ph Phase) {
 	_, span := trace.StartSpan(op.ctx, "optracker/SetPhase")
+
+	prevStatus := op.ToTrackerStatus()
+
 	op.mu.Lock()
 	{
 		op.phase = ph
 		op.ts = time.Now()
 	}
 	op.mu.Unlock()
+
+	op.recordStatuses(prevStatus, op.ToTrackerStatus())
 	span.End()
 }
 
@@ -160,6 +172,9 @@ func (op *Operation) Error() string {
 // an error message. It updates the timestamp.
 func (op *Operation) SetError(err error) {
 	_, span := trace.StartSpan(op.ctx, "optracker/SetError")
+
+	prevStatus := op.ToTrackerStatus()
+
 	op.mu.Lock()
 	{
 		op.phase = PhaseError
@@ -167,7 +182,20 @@ func (op *Operation) SetError(err error) {
 		op.ts = time.Now()
 	}
 	op.mu.Unlock()
+
+	op.recordStatuses(prevStatus, op.ToTrackerStatus())
 	span.End()
+}
+
+func (op *Operation) recordStatuses(prevStatus api.TrackerStatus, newStatus api.TrackerStatus) {
+	if prevStatus != newStatus {
+		stats.Record(op.ctx, observations.GetMeasureFromStatus(prevStatus).M(-1))
+		stats.Record(op.ctx, observations.GetMeasureFromStatus(newStatus).M(1))
+	}
+
+	if newStatus.Match(api.TrackerStatusUnpinned) {
+		stats.Record(op.ctx, observations.GetMeasureFromStatus(api.TrackerStatusPinned).M(-1))
+	}
 }
 
 // Type returns the operation Type.
