@@ -3,8 +3,12 @@
 package adder
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"mime/multipart"
 	"strings"
 
@@ -83,11 +87,56 @@ func (a *Adder) setContext(ctx context.Context) {
 func (a *Adder) FromMultipart(ctx context.Context, r *multipart.Reader) (cid.Cid, error) {
 	logger.Debugf("adding from multipart with params: %+v", a.params)
 
-	f, err := files.NewFileFromPartReader(r, "multipart/form-data")
+	var f files.Directory
+	var err error
+	var wrap bool
+
+	if a.params.Untar {
+		pipeReader, pipeWriter := io.Pipe()
+
+		go func() {
+			for {
+				p, err := r.NextPart()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					logger.Error(err)
+					return
+				}
+				zr, err := gzip.NewReader(p)
+				if err != nil {
+					logger.Error(err)
+					return
+				}
+
+				slurp, err := ioutil.ReadAll(zr)
+				if err != nil {
+					logger.Error(err)
+					return
+				}
+				_, err = pipeWriter.Write(slurp)
+				if err != nil {
+					logger.Error(err)
+					return
+				}
+			}
+		}()
+
+		tr := tar.NewReader(pipeReader)
+		f, wrap, err = tarToDirectory(tr)
+		if wrap && !a.params.Wrap {
+			logger.Warning("overwriting wrap parameter to true")
+			a.params.Wrap = wrap
+		}
+	} else {
+		f, err = files.NewFileFromPartReader(r, "multipart/form-data")
+	}
 	if err != nil {
 		return cid.Undef, err
 	}
 	defer f.Close()
+
 	return a.FromFiles(ctx, f)
 }
 
